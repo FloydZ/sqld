@@ -28,10 +28,10 @@ var (
 	allowRaw = flag.Bool("raw", false, "allow raw sql queries")
 	dsn      = flag.String("dsn", "", "database source name")
 	user     = flag.String("u", "root", "database username")
-	pass     = flag.String("p", "", "database password")
-	host     = flag.String("h", "", "database host")
-	dbtype   = flag.String("type", "mysql", "database type")
-	dbname   = flag.String("db", "", "database name")
+	pass     = flag.String("p", "12345", "database password")
+	host     = flag.String("h", "127.0.0.1", "database host")
+	dbtype   = flag.String("type", "postgres", "database type")
+	dbname   = flag.String("db", "test", "database name")
 	port     = flag.Int("port", 8080, "http port")
 	url      = flag.String("url", "/", "url prefix")
 
@@ -40,6 +40,10 @@ var (
 
 	db *sqlx.DB
 	sq squirrel.StatementBuilderType
+	
+	// to allow the user to select the database dynamcly
+	dbs map[string]*sqlx.DB
+	sqs map[string]squirrel.StatementBuilderType
 )
 
 // RawQuery wraps the request body of a raw sqld request
@@ -105,7 +109,7 @@ func handleFlags() {
 	}
 }
 
-func buildDSN() string {
+func buildDSN(database_ string) string {
 	if dsn != nil && *dsn != "" {
 		return *dsn
 	}
@@ -128,24 +132,25 @@ func buildDSN() string {
 
 	switch *dbtype {
 	case "mysql":
-		return fmt.Sprintf(mysqlDSNTemplate, *user, *pass, *host, *dbname)
+		return fmt.Sprintf(mysqlDSNTemplate, *user, *pass, *host, database_)
 	case "postgres":
-		return fmt.Sprintf(postgresDSNTemplate, *user, *pass, *host, *dbname)
+		return fmt.Sprintf(postgresDSNTemplate, *user, *pass, *host, database_)
 	default:
 		return ""
 	}
 }
 
-func initDB(connect drivers.SQLConnector) (*sqlx.DB, squirrel.StatementBuilderType, error) {
+func initDB(connect drivers.SQLConnector, database_ string) (*sqlx.DB, squirrel.StatementBuilderType, error) {
 	sq := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Question)
 	switch *dbtype {
 	case "mysql":
-		return drivers.InitMySQL(connect, *dbtype, buildDSN())
+		return drivers.InitMySQL(connect, *dbtype, buildDSN(database_))
 	case "postgres":
-		return drivers.InitPostgres(connect, *dbtype, buildDSN())
+		return drivers.InitPostgres(connect, *dbtype, buildDSN(database_))
 	case "sqlite3":
-		return drivers.InitSQLite(connect, *dbtype, buildDSN())
+		return drivers.InitSQLite(connect, *dbtype, buildDSN(database_))
 	}
+	
 	return nil, sq, errors.New("Unsupported database type " + *dbtype)
 }
 
@@ -156,24 +161,37 @@ func closeDB() error {
 	return nil
 }
 
-func parseRequest(r *http.Request) (string, map[string][]string, string) {
+// returns database, table, args
+func parseRequest(r *http.Request) (string, string, map[string][]string) {
 	paths := strings.Split(strings.TrimPrefix(r.URL.Path, *url), "/")
 	table := paths[0]
-	id := ""
+	database := *dbname
 	if len(paths) > 1 {
-		id = paths[1]
+
+		database = paths[0]
+		table = paths[1]
+		
+		if dbs[database] == nil {
+			dbs_, sqs_, err := initDB(sqlx.Connect, database)
+			if err != nil {
+				// if we cannont connect to the db. just return the standard db
+				log.Fatalf("Unable to connect to database: %s\n", err)
+				return *dbname, table, r.URL.Query()
+			}
+			
+			// super dump
+			dbs[database] = dbs_
+			sqs[database] = sqs_
+		}
 	}
-	return table, r.URL.Query(), id
+	return database, table, r.URL.Query()
 }
 
 func buildSelectQuery(r *http.Request) (string, []interface{}, error) {
-	table, args, id := parseRequest(r)
-	query := sq.Select("*").From(table)
+	database, table, args := parseRequest(r)
+	query := sqs[database].Select("*").From(table)
 
-	if id != "" {
-		query = query.Where(squirrel.Eq{"id": id})
-	}
-
+	
 	for key, val := range args {
 		switch key {
 		case "__limit__":
@@ -197,15 +215,11 @@ func buildSelectQuery(r *http.Request) (string, []interface{}, error) {
 }
 
 func buildUpdateQuery(r *http.Request, values map[string]interface{}) (string, []interface{}, error) {
-	table, args, id := parseRequest(r)
-	query := sq.Update("").Table(table)
+	database, table, args := parseRequest(r)
+	query := sqs[database].Update("").Table(table)
 
 	for key, val := range values {
 		query = query.SetMap(squirrel.Eq{key: val})
-	}
-
-	if id != "" {
-		query = query.Where(squirrel.Eq{"id": id})
 	}
 
 	for key, val := range args {
@@ -224,12 +238,8 @@ func buildUpdateQuery(r *http.Request, values map[string]interface{}) (string, [
 }
 
 func buildDeleteQuery(r *http.Request) (string, []interface{}, error) {
-	table, args, id := parseRequest(r)
-	query := sq.Delete("").From(table)
-
-	if id != "" {
-		query = query.Where(squirrel.Eq{"id": id})
-	}
+	database, table, args := parseRequest(r)
+	query := sqs[database].Delete("").From(table)
 
 	for key, val := range args {
 		switch key {
@@ -515,14 +525,23 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 // and starts the http server.
 func main() {
 	log.SetOutput(os.Stdout)
+
+	
+	dbs = map[string]*sqlx.DB{}
+	sqs = map[string]squirrel.StatementBuilderType{}
+	
 	handleFlags()
 
 	var err error
-	db, sq, err = initDB(sqlx.Connect)
+	db, sq, err = initDB(sqlx.Connect, *dbname)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %s\n", err)
 	}
-
+	
+	
+	dbs[*dbname] = db
+	sqs[*dbname] = sq
+	
 	http.HandleFunc(*url, handleQuery)
 	log.Printf("sqld listening on port %d", *port)
 	log.Print(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
