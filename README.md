@@ -12,7 +12,7 @@ SQL over HTTP.
 Install
 -------
 ```
-go get github.com/mmaelzer/sqld
+go get github.com/FloydZ/sqld
 ```
 
 Usage
@@ -29,6 +29,7 @@ Flags:
   -h string
     	database host
   -p string
+
     	database password
   -port int
     	http port (default 8080)
