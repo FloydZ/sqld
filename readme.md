@@ -81,12 +81,6 @@ Interact with the database via URLs.
 http://localhost:8080/table_name
 ```
 
-### With ID
-The following equivalent to a request with `table_name?id=10`
-```
-http://localhost:8080/table_name/10
-```
-
 ### Filtering
 ```
 http://localhost:8080/table_name?id=10
