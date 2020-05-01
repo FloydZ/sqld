@@ -31,15 +31,12 @@ var (
 	pass     = flag.String("p", "12345", "database password")
 	host     = flag.String("h", "127.0.0.1", "database host")
 	dbtype   = flag.String("type", "postgres", "database type")
-	dbname   = flag.String("db", "test", "database name")
+	dbname   = flag.String("db", "", "database name")
 	port     = flag.Int("port", 8080, "http port")
 	url      = flag.String("url", "/", "url prefix")
 
 	mysqlDSNTemplate    = "%s:%s@(%s)/%s?parseTime=true"
 	postgresDSNTemplate = "postgres://%s:%s@%s/%s?sslmode=disable"
-
-	db *sqlx.DB
-	sq squirrel.StatementBuilderType
 	
 	// to allow the user to select the database dynamcly
 	dbs map[string]*sqlx.DB
@@ -142,6 +139,7 @@ func buildDSN(database_ string) string {
 
 func initDB(connect drivers.SQLConnector, database_ string) (*sqlx.DB, squirrel.StatementBuilderType, error) {
 	sq := squirrel.StatementBuilder.PlaceholderFormat(squirrel.Question)
+	
 	switch *dbtype {
 	case "mysql":
 		return drivers.InitMySQL(connect, *dbtype, buildDSN(database_))
@@ -155,11 +153,16 @@ func initDB(connect drivers.SQLConnector, database_ string) (*sqlx.DB, squirrel.
 }
 
 func closeDB() error {
-	if db != nil {
-		return db.Close()
+	for _, v := range dbs { 
+		err := v.Close()
+		if err != nil {
+			return err
+		}	
 	}
+
 	return nil
 }
+
 
 // returns database, table, args
 func parseRequest(r *http.Request) (string, string, map[string][]string) {
@@ -167,10 +170,9 @@ func parseRequest(r *http.Request) (string, string, map[string][]string) {
 	table := paths[0]
 	database := *dbname
 	if len(paths) > 1 {
-
 		database = paths[0]
 		table = paths[1]
-		
+				
 		if dbs[database] == nil {
 			dbs_, sqs_, err := initDB(sqlx.Connect, database)
 			if err != nil {
@@ -182,16 +184,19 @@ func parseRequest(r *http.Request) (string, string, map[string][]string) {
 			// super dump
 			dbs[database] = dbs_
 			sqs[database] = sqs_
+			
+			log.Println("created new connecto to db: " + database)
 		}
 	}
+	
 	return database, table, r.URL.Query()
 }
 
-func buildSelectQuery(r *http.Request) (string, []interface{}, error) {
+
+func buildSelectQuery(r *http.Request) (*sqlx.DB, string, []interface{}, error) {
 	database, table, args := parseRequest(r)
 	query := sqs[database].Select("*").From(table)
 
-	
 	for key, val := range args {
 		switch key {
 		case "__limit__":
@@ -210,11 +215,12 @@ func buildSelectQuery(r *http.Request) (string, []interface{}, error) {
 			query = query.Where(squirrel.Eq{key: val})
 		}
 	}
-
-	return query.ToSql()
+	
+	a, b, c := query.ToSql()
+	return dbs[database], a, b, c
 }
 
-func buildUpdateQuery(r *http.Request, values map[string]interface{}) (string, []interface{}, error) {
+func buildUpdateQuery(r *http.Request, values map[string]interface{}) (*sqlx.DB, string, []interface{}, error) {
 	database, table, args := parseRequest(r)
 	query := sqs[database].Update("").Table(table)
 
@@ -233,11 +239,12 @@ func buildUpdateQuery(r *http.Request, values map[string]interface{}) (string, [
 			query = query.Where(squirrel.Eq{key: val})
 		}
 	}
-
-	return query.ToSql()
+	
+	a, b, c := query.ToSql()
+	return dbs[database], a, b, c
 }
 
-func buildDeleteQuery(r *http.Request) (string, []interface{}, error) {
+func buildDeleteQuery(r *http.Request) (*sqlx.DB, string, []interface{}, error) {
 	database, table, args := parseRequest(r)
 	query := sqs[database].Delete("").From(table)
 
@@ -252,12 +259,13 @@ func buildDeleteQuery(r *http.Request) (string, []interface{}, error) {
 			query = query.Where(squirrel.Eq{key: val})
 		}
 	}
-
-	return query.ToSql()
+	
+	a, b, c := query.ToSql()
+	return dbs[database], a, b, c
 }
 
-func readQuery(sql string, args []interface{}) ([]map[string]interface{}, error) {
-	rows, err := db.Query(sql, args...)
+func readQuery(dbb *sqlx.DB, sql string, args []interface{}) ([]map[string]interface{}, error) {
+	rows, err := dbb.Query(sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -306,13 +314,14 @@ func readQuery(sql string, args []interface{}) ([]map[string]interface{}, error)
 
 // read handles the GET request.
 func read(r *http.Request) (interface{}, *SqldError) {
-	sql, args, err := buildSelectQuery(r)
+	dbb, sql, args, err := buildSelectQuery(r)
 	if err != nil {
 		return nil, BadRequest(err)
 	}
-
-	tableData, err := readQuery(sql, args)
+	
+	tableData, err := readQuery(dbb, sql, args)
 	if err != nil {
+		log.Println(err)
 		return nil, InternalError(err)
 	}
 	return tableData, nil
@@ -320,7 +329,7 @@ func read(r *http.Request) (interface{}, *SqldError) {
 
 // createSingle handles the POST method when only a single model
 // is provided in the request body.
-func createSingle(table string, item map[string]interface{}) (map[string]interface{}, error) {
+func createSingle(database_name string, table string, item map[string]interface{}) (map[string]interface{}, error) {
 	columns := make([]string, len(item))
 	values := make([]interface{}, len(item))
 
@@ -331,13 +340,23 @@ func createSingle(table string, item map[string]interface{}) (map[string]interfa
 		i++
 	}
 
-	query := sq.Insert(table).
+	if dbs[database_name] == nil {
+		dbs_, sqs_, err := initDB(sqlx.Connect, database_name)
+		if err != nil {
+			log.Fatalf("Unable to connect to database: %s\n", err)
+			return nil, err
+		}
+		dbs[database_name] = dbs_
+		sqs[database_name] = sqs_
+	}
+	
+	query := sqs[database_name].Insert(table).
 		Columns(columns...).
 		Values(values...)
 
 	sql, args, err := query.ToSql()
 
-	res, err := db.Exec(sql, args...)
+	res, err := dbs[database_name].Exec(sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -362,11 +381,11 @@ func create(r *http.Request) (interface{}, *SqldError) {
 		return nil, BadRequest(err)
 	}
 
-	table, _, _ := parseRequest(r)
+	database, table, _ := parseRequest(r)
 
 	item, ok := data.(map[string]interface{})
 	if ok {
-		saved, err := createSingle(table, item)
+		saved, err := createSingle(database, table, item)
 		if err != nil {
 			return nil, InternalError(err)
 		}
@@ -389,30 +408,30 @@ func update(r *http.Request) (interface{}, *SqldError) {
 		return nil, BadRequest(err)
 	}
 
-	sql, args, err := buildUpdateQuery(r, data)
+	dbb, sql, args, err := buildUpdateQuery(r, data)
 
 	if err != nil {
 		return nil, BadRequest(err)
 	}
 
-	return execQuery(sql, args)
+	return execQuery(dbb, sql, args)
 }
 
 // del handles the DELETE method.
 func del(r *http.Request) (interface{}, *SqldError) {
-	sql, args, err := buildDeleteQuery(r)
+	dbb, sql, args, err := buildDeleteQuery(r)
 
 	if err != nil {
 		return nil, BadRequest(err)
 	}
 
-	return execQuery(sql, args)
+	return execQuery(dbb, sql, args)
 }
 
 // execQuery will perform a sql query, return the appropriate error code
 // given error states or return an http 204 NO CONTENT on success.
-func execQuery(sql string, args []interface{}) (interface{}, *SqldError) {
-	res, err := db.Exec(sql, args...)
+func execQuery(dbb *sqlx.DB, sql string, args []interface{}) (interface{}, *SqldError) {
+	res, err := dbb.Exec(sql, args...)
 	if err != nil {
 		return nil, BadRequest(err)
 	}
@@ -429,6 +448,7 @@ func execQuery(sql string, args []interface{}) (interface{}, *SqldError) {
 	return nil, nil
 }
 
+// TODO currently not fully supported
 func raw(r *http.Request) (interface{}, *SqldError) {
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -444,13 +464,15 @@ func raw(r *http.Request) (interface{}, *SqldError) {
 
 	var noArgs []interface{}
 	if query.ReadQuery != "" {
-		tableData, err := readQuery(query.ReadQuery, noArgs)
+		// TODO not correct db name
+		tableData, err := readQuery(dbs[*dbname], query.ReadQuery, noArgs)
 		if err != nil {
 			return nil, BadRequest(err)
 		}
 		return tableData, nil
 	} else if query.WriteQuery != "" {
-		res, err := db.Exec(query.WriteQuery, noArgs...)
+		// TODO not correct db name
+		res, err := dbs[*dbname].Exec(query.WriteQuery, noArgs...)
 		if err != nil {
 			return nil, BadRequest(err)
 		}
@@ -526,21 +548,10 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 func main() {
 	log.SetOutput(os.Stdout)
 
-	
 	dbs = map[string]*sqlx.DB{}
 	sqs = map[string]squirrel.StatementBuilderType{}
 	
 	handleFlags()
-
-	var err error
-	db, sq, err = initDB(sqlx.Connect, *dbname)
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %s\n", err)
-	}
-	
-	
-	dbs[*dbname] = db
-	sqs[*dbname] = sq
 	
 	http.HandleFunc(*url, handleQuery)
 	log.Printf("sqld listening on port %d", *port)
